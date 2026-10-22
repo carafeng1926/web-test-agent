@@ -1,0 +1,105 @@
+name: Web Test Agent
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'demo = local fixture; custom = approved target'
+        type: choice
+        options: [demo, custom]
+        default: demo
+        required: true
+      case_file:
+        description: 'custom only: XLSX path under examples/'
+        type: string
+        default: examples/custom.xlsx
+        required: true
+      execute:
+        description: 'Run browser after reviewing the previous plan'
+        type: boolean
+        default: false
+        required: true
+      approved_hash:
+        description: 'Paste the approval hash from the reviewed plan'
+        type: string
+        default: ''
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: web-test-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      approval_hash: ${{ steps.plan.outputs.approval_hash }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Create reviewable plan
+        id: plan
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          CASE_FILE: ${{ inputs.case_file }}
+          TEST_BASE_URL: ${{ vars.TEST_BASE_URL }}
+        run: python -m tools.ci plan
+      - name: Upload plan for review
+        uses: actions/upload-artifact@v5
+        with:
+          name: reviewed-plan-${{ github.run_id }}
+          path: cloud-plan/
+          retention-days: 3
+          if-no-files-found: error
+  execute:
+    if: ${{ inputs.execute }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: web-test
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Download this run's plan
+        uses: actions/download-artifact@v5
+        with:
+          name: reviewed-plan-${{ github.run_id }}
+          path: cloud-plan/
+      - name: Validate explicit approval
+        env:
+          APPROVED_PLAN_HASH: ${{ inputs.approved_hash }}
+          EXPECTED_PLAN_HASH: ${{ needs.prepare.outputs.approval_hash }}
+          TEST_BASE_URL: ${{ vars.TEST_BASE_URL }}
+        run: python -m tools.ci verify
+      - name: Install dependencies and browser
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Execute approved tests
+        env:
+          APPROVED_PLAN_HASH: ${{ inputs.approved_hash }}
+          EXPECTED_PLAN_HASH: ${{ needs.prepare.outputs.approval_hash }}
+          TEST_BASE_URL: ${{ vars.TEST_BASE_URL }}
+          TEST_USER: ${{ secrets.TEST_USER }}
+          TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+        run: python -m tools.ci execute
+      - name: Upload evidence and reports even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-results-${{ github.run_id }}
+          path: cloud-results/
+          retention-days: 3
+          if-no-files-found: warn
